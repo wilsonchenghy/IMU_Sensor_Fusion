@@ -56,6 +56,7 @@ struct KalmanFilter {
 
 KalmanFilter kalman_pitch;
 KalmanFilter kalman_roll;
+KalmanFilter kalman_yaw;
 
 unsigned long prevTime_kalman = 0;
 float dt_kalman = 0.01f;
@@ -210,10 +211,15 @@ void enableSensorMode(int mode) {
         Serial.println("Could not enable gyroscope!");
         while (1) delay(10);
       }
-      Serial.println("Mode: Kalman Filter (Gyro+Accel for Pitch/Roll)");
+      if (!bno08x.enableReport(SH2_MAGNETIC_FIELD_CALIBRATED)) {
+        Serial.println("Could not enable magnetometer!");
+        while (1) delay(10);
+      }
+      Serial.println("Mode: Kalman Filter (Gyro+Accel for Pitch/Roll, Gyro+Mag for Yaw)");
 
       initKalmanFilter(&kalman_pitch, 0.001f, 0.003f, 0.03f);  // Q_angle, Q_bias, R_measure
       initKalmanFilter(&kalman_roll, 0.001f, 0.003f, 0.03f);
+      initKalmanFilter(&kalman_yaw, 0.001f, 0.003f, 0.1f);    // Higher R_measure for magnetometer
       prevTime_kalman = millis();
       break;
   }
@@ -559,7 +565,8 @@ void processComplementaryMode() {
 void processKalmanMode() {
   static float accel_x = 0, accel_y = 0, accel_z = 0;
   static float gyro_x = 0, gyro_y = 0, gyro_z = 0;
-  static bool hasAccel = false, hasGyro = false;
+  static float mag_x = 0, mag_y = 0, mag_z = 0;
+  static bool hasAccel = false, hasGyro = false, hasMag = false;
   
   unsigned long currentTime = millis();
   dt_kalman = (currentTime - prevTime_kalman) / 1000.0f;  // Convert to seconds
@@ -579,38 +586,53 @@ void processKalmanMode() {
     hasGyro = true;
   }
   
-  if (hasAccel && hasGyro) {
+  if (sensorValue.sensorId == SH2_MAGNETIC_FIELD_CALIBRATED) {
+    mag_x = sensorValue.un.magneticField.x;
+    mag_y = sensorValue.un.magneticField.y;
+    mag_z = sensorValue.un.magneticField.z;
+    hasMag = true;
+  }
+  
+  if (hasAccel && hasGyro && hasMag) {
     // Calculate angles from accelerometer (assuming sensor is relatively stable)
     float accel_pitch = atan2(-accel_x, sqrt(accel_y * accel_y + accel_z * accel_z)) * 180.0f / PI;
     float accel_roll = atan2(accel_y, accel_z) * 180.0f / PI;
     
     float gyro_pitch_rate = gyro_y * 180.0f / PI;
     float gyro_roll_rate = gyro_x * 180.0f / PI;
+    float gyro_yaw_rate = gyro_z * 180.0f / PI;
     
+    // Apply tilt compensation to magnetometer
+    float pitch_rad = accel_pitch * PI / 180.0f;
+    float roll_rad = accel_roll * PI / 180.0f;
+    float mag_x_comp, mag_y_comp;
+    applyTiltCompensation(mag_x, mag_y, mag_z, pitch_rad, roll_rad, mag_x_comp, mag_y_comp);
+    
+    // Calculate yaw from magnetometer
+    float mag_yaw = atan2(mag_y_comp, mag_x_comp) * 180.0f / PI;
+    if (mag_yaw < 0) mag_yaw += 360.0f;
+    
+    // Update Kalman filters
     float kalman_pitch_angle = updateKalmanFilter(&kalman_pitch, accel_pitch, gyro_pitch_rate, dt_kalman);
     float kalman_roll_angle = updateKalmanFilter(&kalman_roll, accel_roll, gyro_roll_rate, dt_kalman);
+    float kalman_yaw_angle = updateKalmanFilter(&kalman_yaw, mag_yaw, gyro_yaw_rate, dt_kalman);
     
     kalman_pitch_angle = wrapAngle(kalman_pitch_angle);
     kalman_roll_angle = wrapAngle(kalman_roll_angle);
+    kalman_yaw_angle = wrapAngle(kalman_yaw_angle);
     
     // Print to Serial as JSON
     String serialJson = "{";
     serialJson += "\"mode\":\"kalman\",";
     serialJson += "\"pitch\":" + String(kalman_pitch_angle, 2) + ",";
-    serialJson += "\"roll\":" + String(kalman_roll_angle, 2);
-    // serialJson += "\"roll\":" + String(kalman_roll_angle, 2) + ",";
-    // serialJson += "\"pitch_bias\":" + String(kalman_pitch.bias * 180.0f / PI, 4) + ",";
-    // serialJson += "\"roll_bias\":" + String(kalman_roll.bias * 180.0f / PI, 4) + ",";
-    // serialJson += "\"accel_pitch\":" + String(accel_pitch, 2) + ",";
-    // serialJson += "\"accel_roll\":" + String(accel_roll, 2) + ",";
-    // serialJson += "\"gyro_pitch_rate\":" + String(gyro_pitch_rate, 2) + ",";
-    // serialJson += "\"gyro_roll_rate\":" + String(gyro_roll_rate, 2) + ",";
-    // serialJson += "\"dt\":" + String(dt_kalman, 4);
+    serialJson += "\"roll\":" + String(kalman_roll_angle, 2) + ",";
+    serialJson += "\"yaw\":" + String(kalman_yaw_angle, 2);
     serialJson += "}";
     Serial.println(serialJson);
     
     hasAccel = false;
     hasGyro = false;
+    hasMag = false;
   }
 }
 
