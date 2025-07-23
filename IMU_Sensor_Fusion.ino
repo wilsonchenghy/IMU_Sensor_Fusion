@@ -134,12 +134,6 @@ float updateKalmanFilter(KalmanFilter* kf, float newAngle, float newRate, float 
 }
 
 void enableSensorMode(int mode) {
-  // Disable all reports first
-  bno08x.disableReport(SH2_GAME_ROTATION_VECTOR);
-  bno08x.disableReport(SH2_ACCELEROMETER);
-  bno08x.disableReport(SH2_GYROSCOPE_CALIBRATED);
-  bno08x.disableReport(SH2_MAGNETIC_FIELD_CALIBRATED);
-  
   switch (mode) {
     case MODE_STANDARD:
       if (!bno08x.enableReport(SH2_GAME_ROTATION_VECTOR)) {
