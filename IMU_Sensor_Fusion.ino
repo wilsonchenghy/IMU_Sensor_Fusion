@@ -19,11 +19,12 @@
 #define BNO08X_INT    16
 #define BNO08X_RESET  4
 
-#define MODE_STANDARD    0  // Standard mode of using the library directly
+#define MODE_STANDARD      0  // Standard mode of using the library directly
 #define MODE_ACCELEROMETER 1
 #define MODE_GYROSCOPE     2
 #define MODE_MAGNETOMETER  3
 #define MODE_COMPLEMENTARY 4  // Complementary filter mode
+#define MODE_KALMAN        5  // Kalman filter mode
 
 int currentMode = MODE_STANDARD;
 
@@ -42,6 +43,23 @@ float alpha = 0.96f;  // (96% gyro, 4% accel)
 unsigned long prevTime = 0;
 float dt = 0.01f;
 
+// Kalman Filter
+struct KalmanFilter {
+  float angle;      // Current angle estimate
+  float bias;       // Gyro bias/drift estimate
+  float P[2][2];    // Error covariance matrix
+  float Q_angle;    // Process noise covariance for angle
+  float Q_bias;     // Process noise covariance for bias
+  float R_measure;  // Measurement noise covariance
+};
+
+KalmanFilter kalman_pitch;
+KalmanFilter kalman_roll;
+
+unsigned long prevTime_kalman = 0;
+float dt_kalman = 0.01f;
+
+// Quaternion for calibration
 Quaternion q_calib_inv = {1, 0, 0, 0};
 bool isCalibrated = false;
 
@@ -63,6 +81,56 @@ void quaternionToEuler(const Quaternion& q, float &roll, float &pitch, float &ya
   else if (sinp < -1.0f) sinp = -1.0f;
   pitch = asinf(sinp) * 180.0f / PI;
   yaw   = atan2f(2.0f * (q.w * q.z + q.x * q.y), 1.0f - 2.0f * (q.y * q.y + q.z * q.z)) * 180.0f / PI;
+}
+
+void initKalmanFilter(KalmanFilter* kf, float Q_angle, float Q_bias, float R_measure) {
+  kf->angle = 0.0f;
+  kf->bias = 0.0f;
+  kf->Q_angle = Q_angle;
+  kf->Q_bias = Q_bias;
+  kf->R_measure = R_measure;
+  
+  // Error covariance matrix
+  kf->P[0][0] = 0.0f;
+  kf->P[0][1] = 0.0f;
+  kf->P[1][0] = 0.0f;
+  kf->P[1][1] = 0.0f;
+}
+
+float updateKalmanFilter(KalmanFilter* kf, float newAngle, float newRate, float dt) {
+  // Step 1: Predict (priori estimate)
+  kf->angle += dt * (newRate - kf->bias);
+  
+  // Update error covariance matrix
+  kf->P[0][0] += dt * (dt * kf->P[1][1] - kf->P[0][1] - kf->P[1][0] + kf->Q_angle);
+  kf->P[0][1] -= dt * kf->P[1][1];
+  kf->P[1][0] -= dt * kf->P[1][1];
+  kf->P[1][1] += kf->Q_bias * dt;
+  
+  // Step 2: Update
+  float S = kf->P[0][0] + kf->R_measure; // Innovation covariance
+  float K[2];
+  
+  // Compute Kalman gain
+  K[0] = kf->P[0][0] / S;
+  K[1] = kf->P[1][0] / S;
+  
+  float y = newAngle - kf->angle; // Measurement posterior residual
+  
+  // Update state estimate
+  kf->angle += K[0] * y;
+  kf->bias += K[1] * y;
+  
+  // Update error covariance matrix
+  float P00_temp = kf->P[0][0];
+  float P01_temp = kf->P[0][1];
+  
+  kf->P[0][0] -= K[0] * P00_temp;
+  kf->P[0][1] -= K[0] * P01_temp;
+  kf->P[1][0] -= K[1] * P00_temp;
+  kf->P[1][1] -= K[1] * P01_temp;
+  
+  return kf->angle;
 }
 
 void enableSensorMode(int mode) {
@@ -125,6 +193,22 @@ void enableSensorMode(int mode) {
       yaw_comp = 0.0f;
       prevTime = millis();
       break;
+      
+    case MODE_KALMAN:
+      if (!bno08x.enableReport(SH2_ACCELEROMETER)) {
+        Serial.println("Could not enable accelerometer!");
+        while (1) delay(10);
+      }
+      if (!bno08x.enableReport(SH2_GYROSCOPE_CALIBRATED)) {
+        Serial.println("Could not enable gyroscope!");
+        while (1) delay(10);
+      }
+      Serial.println("Mode: Kalman Filter (Gyro+Accel for Pitch/Roll)");
+
+      initKalmanFilter(&kalman_pitch, 0.001f, 0.003f, 0.03f);  // Q_angle, Q_bias, R_measure
+      initKalmanFilter(&kalman_roll, 0.001f, 0.003f, 0.03f);
+      prevTime_kalman = millis();
+      break;
   }
 }
 
@@ -183,6 +267,10 @@ void loop() {
         currentMode = MODE_COMPLEMENTARY;
         enableSensorMode(currentMode);
         break;
+      case '5':
+        currentMode = MODE_KALMAN;
+        enableSensorMode(currentMode);
+        break;
     }
   }
 
@@ -201,6 +289,9 @@ void loop() {
       break;
     case MODE_COMPLEMENTARY:
       processComplementaryMode();
+      break;
+    case MODE_KALMAN:
+      processKalmanMode();
       break;
   }
 }
@@ -383,20 +474,79 @@ void processComplementaryMode() {
     serialJson += "\"mode\":\"complementary\",";
     serialJson += "\"pitch\":" + String(pitch_comp, 2) + ",";
     serialJson += "\"roll\":" + String(roll_comp, 2) + ",";
-    serialJson += "\"yaw\":" + String(yaw_comp, 2) + ",";
+    serialJson += "\"yaw\":" + String(yaw_comp, 2);
+    // serialJson += "\"yaw\":" + String(yaw_comp, 2) + ",";
     // serialJson += "\"accel_pitch\":" + String(accel_pitch, 2) + ",";
     // serialJson += "\"accel_roll\":" + String(accel_roll, 2) + ",";
     // serialJson += "\"mag_yaw\":" + String(mag_yaw, 2) + ",";
     // serialJson += "\"gyro_pitch\":" + String(gyro_pitch, 2) + ",";
     // serialJson += "\"gyro_roll\":" + String(gyro_roll, 2) + ",";
     // serialJson += "\"gyro_yaw\":" + String(gyro_yaw, 2) + ",";
-    serialJson += "\"dt\":" + String(dt, 4);
+    // serialJson += "\"dt\":" + String(dt, 4);
     serialJson += "}";
     Serial.println(serialJson);
     
     hasAccel = false;
     hasGyro = false;
     hasMag = false;
+  }
+}
+
+void processKalmanMode() {
+  static float accel_x = 0, accel_y = 0, accel_z = 0;
+  static float gyro_x = 0, gyro_y = 0, gyro_z = 0;
+  static bool hasAccel = false, hasGyro = false;
+  
+  unsigned long currentTime = millis();
+  dt_kalman = (currentTime - prevTime_kalman) / 1000.0f;  // Convert to seconds
+  prevTime_kalman = currentTime;
+  
+  if (sensorValue.sensorId == SH2_ACCELEROMETER) {
+    accel_x = sensorValue.un.accelerometer.x;
+    accel_y = sensorValue.un.accelerometer.y;
+    accel_z = sensorValue.un.accelerometer.z;
+    hasAccel = true;
+  }
+  
+  if (sensorValue.sensorId == SH2_GYROSCOPE_CALIBRATED) {
+    gyro_x = sensorValue.un.gyroscope.x;
+    gyro_y = sensorValue.un.gyroscope.y;
+    gyro_z = sensorValue.un.gyroscope.z;
+    hasGyro = true;
+  }
+  
+  if (hasAccel && hasGyro) {
+    // Calculate angles from accelerometer (assuming sensor is relatively stable)
+    float accel_pitch = atan2(-accel_x, sqrt(accel_y * accel_y + accel_z * accel_z)) * 180.0f / PI;
+    float accel_roll = atan2(accel_y, accel_z) * 180.0f / PI;
+    
+    float gyro_pitch_rate = gyro_y * 180.0f / PI;
+    float gyro_roll_rate = gyro_x * 180.0f / PI;
+    
+    float kalman_pitch_angle = updateKalmanFilter(&kalman_pitch, accel_pitch, gyro_pitch_rate, dt_kalman);
+    float kalman_roll_angle = updateKalmanFilter(&kalman_roll, accel_roll, gyro_roll_rate, dt_kalman);
+    
+    kalman_pitch_angle = wrapAngle(kalman_pitch_angle);
+    kalman_roll_angle = wrapAngle(kalman_roll_angle);
+    
+    // Print to Serial as JSON
+    String serialJson = "{";
+    serialJson += "\"mode\":\"kalman\",";
+    serialJson += "\"pitch\":" + String(kalman_pitch_angle, 2) + ",";
+    serialJson += "\"roll\":" + String(kalman_roll_angle, 2);
+    // serialJson += "\"roll\":" + String(kalman_roll_angle, 2) + ",";
+    // serialJson += "\"pitch_bias\":" + String(kalman_pitch.bias * 180.0f / PI, 4) + ",";
+    // serialJson += "\"roll_bias\":" + String(kalman_roll.bias * 180.0f / PI, 4) + ",";
+    // serialJson += "\"accel_pitch\":" + String(accel_pitch, 2) + ",";
+    // serialJson += "\"accel_roll\":" + String(accel_roll, 2) + ",";
+    // serialJson += "\"gyro_pitch_rate\":" + String(gyro_pitch_rate, 2) + ",";
+    // serialJson += "\"gyro_roll_rate\":" + String(gyro_roll_rate, 2) + ",";
+    // serialJson += "\"dt\":" + String(dt_kalman, 4);
+    serialJson += "}";
+    Serial.println(serialJson);
+    
+    hasAccel = false;
+    hasGyro = false;
   }
 }
 
