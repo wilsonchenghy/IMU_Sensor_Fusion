@@ -22,9 +22,10 @@
 #define MODE_STANDARD      0  // Standard mode of using the library directly
 #define MODE_ACCELEROMETER 1
 #define MODE_GYROSCOPE     2
-#define MODE_MAGNETOMETER  3
-#define MODE_COMPLEMENTARY 4  // Complementary filter mode
-#define MODE_KALMAN        5  // Kalman filter mode
+#define MODE_MAGNETOMETER  3  // Magnetometer without tilt compensation
+#define MODE_MAGNETOMETER_TILT_COMP  4  // Magnetometer with tilt compensation
+#define MODE_COMPLEMENTARY 5  // Complementary filter mode
+#define MODE_KALMAN        6  // Kalman filter mode
 
 int currentMode = MODE_STANDARD;
 
@@ -164,7 +165,19 @@ void enableSensorMode(int mode) {
         Serial.println("Could not enable magnetometer!");
         while (1) delay(10);
       }
-      Serial.println("Mode: Magnetometer");
+      Serial.println("Mode: Magnetometer (without tilt compensation)");
+      break;
+      
+    case MODE_MAGNETOMETER_TILT_COMP:
+      if (!bno08x.enableReport(SH2_ACCELEROMETER)) {
+        Serial.println("Could not enable accelerometer!");
+        while (1) delay(10);
+      }
+      if (!bno08x.enableReport(SH2_MAGNETIC_FIELD_CALIBRATED)) {
+        Serial.println("Could not enable magnetometer!");
+        while (1) delay(10);
+      }
+      Serial.println("Mode: Magnetometer (with tilt compensation)");
       break;
       
     case MODE_COMPLEMENTARY:
@@ -258,10 +271,14 @@ void loop() {
         enableSensorMode(currentMode);
         break;
       case '4':
-        currentMode = MODE_COMPLEMENTARY;
+        currentMode = MODE_MAGNETOMETER_TILT_COMP;
         enableSensorMode(currentMode);
         break;
       case '5':
+        currentMode = MODE_COMPLEMENTARY;
+        enableSensorMode(currentMode);
+        break;
+      case '6':
         currentMode = MODE_KALMAN;
         enableSensorMode(currentMode);
         break;
@@ -279,6 +296,9 @@ void loop() {
       processGyroscopeMode();
       break;
     case MODE_MAGNETOMETER:
+      processMagnetometerNoTiltMode();
+      break;
+    case MODE_MAGNETOMETER_TILT_COMP:
       processMagnetometerMode();
       break;
     case MODE_COMPLEMENTARY:
@@ -378,29 +398,74 @@ void processGyroscopeMode() {
   }
 }
 
-void processMagnetometerMode() {
+void processMagnetometerNoTiltMode() {
   if (sensorValue.sensorId == SH2_MAGNETIC_FIELD_CALIBRATED) {
-    float x = sensorValue.un.magneticField.x;
-    float y = sensorValue.un.magneticField.y;
-    float z = sensorValue.un.magneticField.z;
+    float mag_x = sensorValue.un.magneticField.x;
+    float mag_y = sensorValue.un.magneticField.y;
+    float mag_z = sensorValue.un.magneticField.z;
     
     // Calculate magnitude
-    float magnitude = sqrt(x*x + y*y + z*z);
+    float magnitude = sqrt(mag_x*mag_x + mag_y*mag_y + mag_z*mag_z);
     
-    // Calculate heading (assuming sensor is level)
-    float heading = atan2(y, x) * 180.0f / PI;
+    // Calculate heading without tilt compensation (assumes sensor is level)
+    float heading = atan2(mag_y, mag_x) * 180.0f / PI;
     if (heading < 0) heading += 360.0f;
     
     // Print to Serial as JSON
     String serialJson = "{";
-    serialJson += "\"mode\":\"magnetometer\",";
-    serialJson += "\"x\":" + String(x, 4) + ",";
-    serialJson += "\"y\":" + String(y, 4) + ",";
-    serialJson += "\"z\":" + String(z, 4) + ",";
+    serialJson += "\"mode\":\"magnetometer_no_tilt\",";
+    serialJson += "\"x\":" + String(mag_x, 4) + ",";
+    serialJson += "\"y\":" + String(mag_y, 4) + ",";
+    serialJson += "\"z\":" + String(mag_z, 4) + ",";
     serialJson += "\"magnitude\":" + String(magnitude, 4) + ",";
     serialJson += "\"heading\":" + String(heading, 2);
     serialJson += "}";
     Serial.println(serialJson);
+  }
+}
+
+void processMagnetometerMode() {
+  static float accel_x = 0, accel_y = 0, accel_z = 0;
+  static bool hasAccel = false;
+  
+  if (sensorValue.sensorId == SH2_ACCELEROMETER) {
+    accel_x = sensorValue.un.accelerometer.x;
+    accel_y = sensorValue.un.accelerometer.y;
+    accel_z = sensorValue.un.accelerometer.z;
+    hasAccel = true;
+  }
+  
+  if (sensorValue.sensorId == SH2_MAGNETIC_FIELD_CALIBRATED && hasAccel) {
+    float mag_x = sensorValue.un.magneticField.x;
+    float mag_y = sensorValue.un.magneticField.y;
+    float mag_z = sensorValue.un.magneticField.z;
+    
+    // Calculate magnitude
+    float magnitude = sqrt(mag_x*mag_x + mag_y*mag_y + mag_z*mag_z);
+    
+    float pitch = atan2(-accel_x, sqrt(accel_y * accel_y + accel_z * accel_z));
+    float roll = atan2(accel_y, accel_z);
+    
+    float mag_x_comp, mag_y_comp;
+    applyTiltCompensation(mag_x, mag_y, mag_z, pitch, roll, mag_x_comp, mag_y_comp);
+    
+    float heading = atan2(mag_y_comp, mag_x_comp) * 180.0f / PI;
+    if (heading < 0) heading += 360.0f;
+    
+    // Print to Serial as JSON
+    String serialJson = "{";
+    serialJson += "\"mode\":\"magnetometer_tilt_comp\",";
+    serialJson += "\"x\":" + String(mag_x, 4) + ",";
+    serialJson += "\"y\":" + String(mag_y, 4) + ",";
+    serialJson += "\"z\":" + String(mag_z, 4) + ",";
+    serialJson += "\"magnitude\":" + String(magnitude, 4) + ",";
+    serialJson += "\"heading\":" + String(heading, 2) + ",";
+    serialJson += "\"pitch\":" + String(pitch * 180.0f / PI, 2) + ",";
+    serialJson += "\"roll\":" + String(roll * 180.0f / PI, 2);
+    serialJson += "}";
+    Serial.println(serialJson);
+    
+    hasAccel = false;
   }
 }
 
@@ -441,8 +506,13 @@ void processComplementaryMode() {
     float accel_pitch = atan2(-accel_x, sqrt(accel_y * accel_y + accel_z * accel_z)) * 180.0f / PI;
     float accel_roll = atan2(accel_y, accel_z) * 180.0f / PI;
     
-    // Calculate yaw from magnetometer (assuming sensor is level)
-    float mag_yaw = atan2(mag_y, mag_x) * 180.0f / PI;
+    float pitch_rad = accel_pitch * PI / 180.0f;
+    float roll_rad = accel_roll * PI / 180.0f;
+    
+    float mag_x_comp, mag_y_comp;
+    applyTiltCompensation(mag_x, mag_y, mag_z, pitch_rad, roll_rad, mag_x_comp, mag_y_comp);
+    
+    float mag_yaw = atan2(mag_y_comp, mag_x_comp) * 180.0f / PI;
     if (mag_yaw < 0) mag_yaw += 360.0f;
     
     // Integrate gyroscope data
@@ -548,4 +618,13 @@ float wrapAngle(float angle) {
   while (angle > 180.0f) angle -= 360.0f;
   while (angle < -180.0f) angle += 360.0f;
   return angle;
+}
+
+// Tilt compensation for magnetometer
+void applyTiltCompensation(float mag_x, float mag_y, float mag_z, 
+                          float pitch_rad, float roll_rad,
+                          float &mag_x_comp, float &mag_y_comp) {
+  
+  mag_x_comp = mag_x * cos(pitch_rad) + mag_z * sin(pitch_rad);
+  mag_y_comp = mag_x * sin(roll_rad) * sin(pitch_rad) + mag_y * cos(roll_rad) - mag_z * sin(roll_rad) * cos(pitch_rad);
 }
