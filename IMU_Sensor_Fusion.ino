@@ -85,6 +85,21 @@ void quaternionToEuler(const Quaternion& q, float &roll, float &pitch, float &ya
   yaw   = atan2f(2.0f * (q.w * q.z + q.x * q.y), 1.0f - 2.0f * (q.y * q.y + q.z * q.z)) * 180.0f / PI;
 }
 
+// Body rates to euler rates
+void bodyRatesToEulerRates(float wx, float wy, float wz, 
+                          float roll_rad, float pitch_rad, float yaw_rad,
+                          float &roll_rate, float &pitch_rate, float &yaw_rate) {
+  // Avoid division by zero when cos(pitch) is close to zero
+  float cos_pitch = cos(pitch_rad);
+  if (fabs(cos_pitch) < 0.001f) {
+    cos_pitch = 0.001f;
+  }
+  
+  roll_rate = wx + wy * sin(roll_rad) * tan(pitch_rad) + wz * cos(roll_rad) * tan(pitch_rad);
+  pitch_rate = wy * cos(roll_rad) - wz * sin(roll_rad);
+  yaw_rate = wy * sin(roll_rad) / cos_pitch + wz * cos(roll_rad) / cos_pitch;
+}
+
 void initKalmanFilter(KalmanFilter* kf, float Q_angle, float Q_bias, float R_measure) {
   kf->angle = 0.0f;
   kf->bias = 0.0f;
@@ -519,12 +534,18 @@ void processComplementaryMode() {
     applyTiltCompensation(mag_x, mag_y, mag_z, pitch_rad, roll_rad, mag_x_comp, mag_y_comp);
     
     float mag_yaw = atan2(mag_y_comp, mag_x_comp) * 180.0f / PI;
-    if (mag_yaw < 0) mag_yaw += 360.0f;
+    if (mag_yaw < 0) mag_yaw += 360.0f;    
     
-    // Integrate gyroscope data
-    float gyro_pitch = pitch_comp + gyro_y * dt;
-    float gyro_roll = roll_comp + gyro_x * dt;
-    float gyro_yaw = yaw_comp + gyro_z * dt;
+    float roll_rate, pitch_rate, yaw_rate;
+    float current_roll_rad = roll_comp * PI / 180.0f;
+    float current_pitch_rad = pitch_comp * PI / 180.0f;
+    float current_yaw_rad = yaw_comp * PI / 180.0f;
+    bodyRatesToEulerRates(gyro_x, gyro_y, gyro_z, current_roll_rad, current_pitch_rad, current_yaw_rad, 
+                         roll_rate, pitch_rate, yaw_rate);
+    
+    float gyro_pitch = pitch_comp + (pitch_rate * 180.0f / PI) * dt;
+    float gyro_roll = roll_comp + (roll_rate * 180.0f / PI) * dt;
+    float gyro_yaw = yaw_comp + (yaw_rate * 180.0f / PI) * dt;
     
     // Complementary filter for pitch and roll (gyro + accel)
     pitch_comp = alpha * gyro_pitch + (1.0f - alpha) * accel_pitch;
@@ -598,10 +619,6 @@ void processKalmanMode() {
     float accel_pitch = atan2(-accel_x, sqrt(accel_y * accel_y + accel_z * accel_z)) * 180.0f / PI;
     float accel_roll = atan2(accel_y, accel_z) * 180.0f / PI;
     
-    float gyro_pitch_rate = gyro_y * 180.0f / PI;
-    float gyro_roll_rate = gyro_x * 180.0f / PI;
-    float gyro_yaw_rate = gyro_z * 180.0f / PI;
-    
     // Apply tilt compensation to magnetometer
     float pitch_rad = accel_pitch * PI / 180.0f;
     float roll_rad = accel_roll * PI / 180.0f;
@@ -611,6 +628,18 @@ void processKalmanMode() {
     // Calculate yaw from magnetometer
     float mag_yaw = atan2(mag_y_comp, mag_x_comp) * 180.0f / PI;
     if (mag_yaw < 0) mag_yaw += 360.0f;
+    
+    float current_pitch_rad = kalman_pitch.angle * PI / 180.0f;
+    float current_roll_rad = kalman_roll.angle * PI / 180.0f;
+    float current_yaw_rad = kalman_yaw.angle * PI / 180.0f;
+    
+    float roll_rate, pitch_rate, yaw_rate;
+    bodyRatesToEulerRates(gyro_x, gyro_y, gyro_z, current_roll_rad, current_pitch_rad, current_yaw_rad, 
+                         roll_rate, pitch_rate, yaw_rate);
+    
+    float gyro_pitch_rate = pitch_rate * 180.0f / PI;
+    float gyro_roll_rate = roll_rate * 180.0f / PI;
+    float gyro_yaw_rate = yaw_rate * 180.0f / PI;
     
     // Update Kalman filters
     float kalman_pitch_angle = updateKalmanFilter(&kalman_pitch, accel_pitch, gyro_pitch_rate, dt_kalman);
